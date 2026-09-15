@@ -12,6 +12,14 @@ ROLE_NAME = "Счетовод"             # Название роли для в
 TARGET_COUNT = 100                 # До скольких считаем (классический режим и рубеж)
 STATE_FILE = "state.json"          # Файл для сохранения состояния
 
+# ID сервера для мгновенной синхронизации слэш-команд (None = глобально, до 1 часа)
+GUILD_ID = None                    # например: 123456789012345678
+
+# ← НОВОЕ: могут ли админы участвовать в счёте?
+#   True  — админ считается как игрок, но бот НЕ удаляет его сообщения и НЕ ругает
+#   False — бот полностью игнорирует сообщения админов в канале счёта
+ADMINS_CAN_COUNT = True
+
 # === РЕЖИМЫ ===
 MODE_CLASSIC = "classic"                # сброс при ошибке, победа на 100
 MODE_ENDLESS = "endless"                # без сброса, счёт до бесконечности
@@ -30,14 +38,26 @@ intents.guilds = True
 intents.members = True
 intents.reactions = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+# Префиксные команды не используются — фиктивный префикс
+bot = commands.Bot(command_prefix="\u0000", intents=intents)
 
 # === СОСТОЯНИЕ СЧЁТА ===
 current_count = 0
 last_user_id = None
 participants = set()
 mode = MODE_CLASSIC
-milestones_reached = set()   # какие рубежи (кратные TARGET_COUNT) уже награждены
+milestones_reached = set()
+
+
+# ============================================================
+#                    ХЕЛПЕР: АДМИН?
+# ============================================================
+
+def is_admin(member: discord.Member) -> bool:
+    """Проверяет, есть ли у участника права администратора."""
+    if not isinstance(member, discord.Member):
+        return False
+    return member.guild_permissions.administrator
 
 
 # ============================================================
@@ -94,9 +114,17 @@ async def on_ready():
     print(f"📋 Канал для счёта: {CHANNEL_ID}")
     print(f"🎮 Режим: {MODE_NAMES.get(mode, mode)}")
     print(f"🎯 Рубеж (TARGET_COUNT): {TARGET_COUNT}")
+    print(f"👑 Админы могут считать: {ADMINS_CAN_COUNT}")
+
     try:
-        synced = await bot.tree.sync()
-        print(f"🔁 Синхронизировано {len(synced)} слэш-команд")
+        if GUILD_ID:
+            guild = discord.Object(id=GUILD_ID)
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            print(f"🔁 Синхронизировано {len(synced)} слэш-команд на сервере {GUILD_ID}")
+        else:
+            synced = await bot.tree.sync()
+            print(f"🔁 Синхронизировано {len(synced)} слэш-команд глобально")
     except Exception as e:
         print(f"⚠️ Ошибка синхронизации команд: {e}")
 
@@ -106,20 +134,23 @@ async def on_message(message):
     if message.author.bot:
         return
 
-    # Обрабатываем префиксные команды
-    if message.content.startswith(bot.command_prefix):
-        await bot.process_commands(message)
-        return
-
     if message.channel.id != CHANNEL_ID:
         return
 
     global current_count, last_user_id, participants
 
     content = message.content.strip()
+    author_is_admin = is_admin(message.author)
 
-    # === Не число — удаляем и предупреждаем ===
+    # === Если админ, а режим "не считать" — игнорируем полностью ===
+    if author_is_admin and not ADMINS_CAN_COUNT:
+        return
+
+    # === Не число ===
     if not content.isdigit():
+        if author_is_admin:
+            # Админу не удаляем сообщение и не пишем предупреждение — просто молчим
+            return
         try:
             await message.delete()
         except discord.Forbidden:
@@ -135,6 +166,9 @@ async def on_message(message):
 
     # === Нельзя считать дважды подряд ===
     if message.author.id == last_user_id:
+        if author_is_admin:
+            # Админу не мешаем — просто не засчитываем
+            return
         try:
             await message.delete()
         except discord.Forbidden:
@@ -160,14 +194,12 @@ async def on_message(message):
         except discord.Forbidden:
             pass
 
-        # --- Логика победы/рубежа зависит от режима ---
         if mode == MODE_CLASSIC:
             if current_count == TARGET_COUNT:
                 await handle_classic_success(message)
                 return
 
         elif mode in (MODE_ENDLESS, MODE_ENDLESS_SOFT):
-            # Каждые TARGET_COUNT чисел — выдаём роль
             if current_count % TARGET_COUNT == 0:
                 milestone = current_count
                 if milestone not in milestones_reached:
@@ -187,10 +219,12 @@ async def on_message(message):
             milestones_reached.clear()
             save_state()
 
-            try:
-                await message.add_reaction("❌")
-            except discord.Forbidden:
-                pass
+            # Админу не ставим реакцию ❌ (чтобы не привлекать внимания), но сообщение оставляем
+            if not author_is_admin:
+                try:
+                    await message.add_reaction("❌")
+                except discord.Forbidden:
+                    pass
 
             fail_phrases = [
                 "испортил счёт на",
@@ -200,8 +234,10 @@ async def on_message(message):
                 "уронил счёт на",
             ]
 
+            # Если ошибся админ — сообщение публикуем, но без упоминания (mention)
+            mention = "" if author_is_admin else f"{message.author.mention} "
             fail_msg = await message.channel.send(
-                f"💥 {message.author.mention} "
+                f"💥 {mention}"
                 f"**{random.choice(fail_phrases)} {broken_at}!!**\n"
                 f"Следующее число — **1**. Игра начинается сначала."
             )
@@ -212,13 +248,15 @@ async def on_message(message):
 
         # ---------------- ENDLESS (без сброса) ----------------
         elif mode == MODE_ENDLESS:
-            try:
-                await message.add_reaction("❌")
-            except discord.Forbidden:
-                pass
+            if not author_is_admin:
+                try:
+                    await message.add_reaction("❌")
+                except discord.Forbidden:
+                    pass
 
+            mention = "" if author_is_admin else f"{message.author.mention}, "
             fail_msg = await message.channel.send(
-                f"⚠️ {message.author.mention}, сейчас ждали **{expected}**, а не **{number}**.\n"
+                f"⚠️ {mention}сейчас ждали **{expected}**, а не **{number}**.\n"
                 f"В бесконечном режиме счёт **не сбрасывается**. "
                 f"Следующее число — **{expected}**."
             )
@@ -229,29 +267,28 @@ async def on_message(message):
 
         # ---------------- ENDLESS_SOFT (откат к рубежу) ----------------
         elif mode == MODE_ENDLESS_SOFT:
-            # Ближайший достигнутый рубеж (кратный TARGET_COUNT), <= broken_at
             rollback_to = (broken_at // TARGET_COUNT) * TARGET_COUNT
-            # Если рубежей ещё не было — откат к 0
             lost = broken_at - rollback_to
 
             current_count = rollback_to
-            last_user_id = None        # разрешаем тому же игроку продолжить
-            # participants НЕ очищаем — цепочка продолжается, люди те же
+            last_user_id = None
 
             save_state()
 
-            try:
-                await message.add_reaction("💥")
-            except discord.Forbidden:
-                pass
+            if not author_is_admin:
+                try:
+                    await message.add_reaction("💥")
+                except discord.Forbidden:
+                    pass
 
             if rollback_to == 0:
                 rollback_text = "**0** (рубежей ещё не было)"
             else:
                 rollback_text = f"**{rollback_to}** (последний рубеж)"
 
+            mention = "" if author_is_admin else f"{message.author.mention} "
             fail_msg = await message.channel.send(
-                f"💥 {message.author.mention} ошибся на **{broken_at}**!\n"
+                f"💥 {mention}ошибся на **{broken_at}**!\n"
                 f"🔽 Откат до {rollback_text}. Потеряно чисел: **{lost}**.\n"
                 f"Следующее число — **{current_count + 1}**."
             )
@@ -268,7 +305,6 @@ async def on_message(message):
 # ============================================================
 
 async def give_role_to_participants(guild, reason: str):
-    """Выдаёт роль всем участникам. Возвращает (success_count, failed_list) или (None, [])."""
     role = discord.utils.get(guild.roles, name=ROLE_NAME)
     if role is None:
         return None, []
@@ -295,7 +331,6 @@ async def give_role_to_participants(guild, reason: str):
 # ============================================================
 
 async def handle_classic_success(message):
-    """Классический режим: досчитали до TARGET_COUNT."""
     global current_count, last_user_id, participants
 
     guild = message.guild
@@ -349,7 +384,6 @@ async def handle_classic_success(message):
 
 
 async def handle_endless_milestone(message, milestone):
-    """Бесконечные режимы: достигли рубежа, кратного TARGET_COUNT."""
     guild = message.guild
     mentions = " ".join(f"<@{uid}>" for uid in participants) or "—"
 
@@ -398,7 +432,7 @@ async def handle_endless_milestone(message, milestone):
 
 
 # ============================================================
-#                    СЛЭШ-КОМАНДА /change_mode
+#                    СЛЭШ-КОМАНДЫ
 # ============================================================
 
 @bot.tree.command(name="change_mode", description="Сменить режим счёта")
@@ -417,7 +451,6 @@ async def change_mode(
     new_mode: app_commands.Choice[str],
     reset: bool = False,
 ):
-    """Сменить режим счёта. Только для администраторов."""
     global mode
 
     old_mode = mode
@@ -436,62 +469,47 @@ async def change_mode(
     )
 
 
-# ============================================================
-#                    ПРЕФИКСНЫЕ КОМАНДЫ
-# ============================================================
-
-@bot.command(name="reset_count")
-@commands.has_permissions(administrator=True)
-async def reset_count(ctx):
-    """Сбросить счёт вручную. Только для администраторов."""
+@bot.tree.command(name="reset_count", description="Сбросить счёт вручную")
+@app_commands.default_permissions(administrator=True)
+async def reset_count(interaction: discord.Interaction):
     reset_state()
-    await ctx.send("🔄 Счёт сброшен вручную. Начинаем с **1**.")
+    await interaction.response.send_message(
+        "🔄 Счёт сброшен вручную. Начинаем с **1**.",
+        ephemeral=False,
+    )
 
 
-@reset_count.error
-async def reset_count_error(ctx, error):
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.send("❌ У вас нет прав на эту команду. Нужны права **администратора**.")
-
-
-@bot.command(name="set_count")
-@commands.has_permissions(administrator=True)
-async def set_count(ctx, number: int):
-    """Установить текущее число вручную. Только для администраторов."""
+@bot.tree.command(name="set_count", description="Установить текущее число вручную")
+@app_commands.describe(number="Число, с которого продолжится счёт")
+@app_commands.default_permissions(administrator=True)
+async def set_count(interaction: discord.Interaction, number: int):
     global current_count
     current_count = number
     save_state()
-    await ctx.send(f"✅ Счёт установлен на **{number}**. Следующее число — **{number + 1}**.")
+    await interaction.response.send_message(
+        f"✅ Счёт установлен на **{number}**. Следующее число — **{number + 1}**.",
+        ephemeral=False,
+    )
 
 
-@set_count.error
-async def set_count_error(ctx, error):
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.send("❌ У вас нет прав на эту команду. Нужны права **администратора**.")
-    elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("❌ Укажите число. Пример: `!set_count 50`")
-    elif isinstance(error, commands.BadArgument):
-        await ctx.send("❌ Нужно указать целое число. Пример: `!set_count 50`")
-
-
-@bot.command(name="count_status")
-async def count_status(ctx):
-    """Показать текущий статус счёта. Доступно всем."""
-    # Ближайший рубеж для endless_soft
+@bot.tree.command(name="count_status", description="Показать текущий статус счёта")
+async def count_status(interaction: discord.Interaction):
     if mode == MODE_ENDLESS_SOFT:
         last_milestone = (current_count // TARGET_COUNT) * TARGET_COUNT
-        rollback_hint = f"Откат при ошибке к: **{last_milestone}**"
+        rollback_hint = f"**{last_milestone}**"
     else:
         rollback_hint = "—"
 
-    await ctx.send(
+    await interaction.response.send_message(
         f"📊 **Статус счёта:**\n"
         f"Режим: **{MODE_NAMES.get(mode, mode)}**\n"
         f"Текущее число: **{current_count}**\n"
         f"Участников в цепочке: **{len(participants)}**\n"
         f"Рубеж: **{TARGET_COUNT}**\n"
         f"Следующее число: **{current_count + 1}**\n"
-        f"Откат при ошибке: {rollback_hint}"
+        f"Откат при ошибке: {rollback_hint}\n"
+        f"Админы считают: **{'да' if ADMINS_CAN_COUNT else 'нет'}**",
+        ephemeral=True,
     )
 
 
