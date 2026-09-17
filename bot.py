@@ -73,6 +73,14 @@ def get_stats(user_id: int) -> dict:
     return player_stats[key]
 
 
+async def safe_add_reaction(message: discord.Message, emoji: str):
+    """Ставит реакцию, игнорируя Forbidden и NotFound."""
+    try:
+        await message.add_reaction(emoji)
+    except (discord.Forbidden, discord.NotFound):
+        pass
+
+
 # ============================================================
 #                    СОХРАНЕНИЕ / ЗАГРУЗКА
 # ============================================================
@@ -319,10 +327,7 @@ async def handle_count_message(message):
             except Exception as e:
                 print(f"⚠️ Ошибка обновления роли топ-1: {e}")
 
-        try:
-            await message.add_reaction("✅")
-        except discord.Forbidden:
-            pass
+        await safe_add_reaction(message, "✅")
 
         if mode == MODE_CLASSIC:
             if current_count == TARGET_COUNT:
@@ -356,10 +361,7 @@ async def handle_count_message(message):
             await save_state_async()
 
             if not author_is_admin:
-                try:
-                    await message.add_reaction("❌")
-                except discord.Forbidden:
-                    pass
+                await safe_add_reaction(message, "❌")
 
             fail_phrases = [
                 "испортил счёт на",
@@ -375,18 +377,12 @@ async def handle_count_message(message):
                 f"**{random.choice(fail_phrases)} {broken_at}!!**\n"
                 f"Следующее число — **1**. Игра начинается сначала."
             )
-            try:
-                await fail_msg.add_reaction("😡")
-            except discord.Forbidden:
-                pass
+            await safe_add_reaction(fail_msg, "😡")
 
         # ---------------- ENDLESS ----------------
         elif mode == MODE_ENDLESS:
             if not author_is_admin:
-                try:
-                    await message.add_reaction("❌")
-                except discord.Forbidden:
-                    pass
+                await safe_add_reaction(message, "❌")
 
             mention = "" if author_is_admin else f"{message.author.mention}, "
             fail_msg = await message.channel.send(
@@ -394,10 +390,7 @@ async def handle_count_message(message):
                 f"В бесконечном режиме счёт **не сбрасывается**. "
                 f"Следующее число — **{expected}**."
             )
-            try:
-                await fail_msg.add_reaction("🤔")
-            except discord.Forbidden:
-                pass
+            await safe_add_reaction(fail_msg, "🤔")
 
         # ---------------- ENDLESS_SOFT ----------------
         elif mode == MODE_ENDLESS_SOFT:
@@ -409,10 +402,7 @@ async def handle_count_message(message):
             await save_state_async()
 
             if not author_is_admin:
-                try:
-                    await message.add_reaction("💥")
-                except discord.Forbidden:
-                    pass
+                await safe_add_reaction(message, "💥")
 
             if rollback_to == 0:
                 rollback_text = "**0** (рубежей ещё не было)"
@@ -425,10 +415,7 @@ async def handle_count_message(message):
                 f"🔽 Откат до {rollback_text}. Потеряно чисел: **{lost}**.\n"
                 f"Следующее число — **{current_count + 1}**."
             )
-            try:
-                await fail_msg.add_reaction("😤")
-            except discord.Forbidden:
-                pass
+            await safe_add_reaction(fail_msg, "😤")
 
         return
 
@@ -506,12 +493,9 @@ async def handle_classic_success(message):
         except (discord.Forbidden, discord.HTTPException):
             pass
 
-        try:
-            await victory_msg.add_reaction("🎉")
-            await victory_msg.add_reaction("🏆")
-            await victory_msg.add_reaction("🥳")
-        except discord.Forbidden:
-            pass
+        await safe_add_reaction(victory_msg, "🎉")
+        await safe_add_reaction(victory_msg, "🏆")
+        await safe_add_reaction(victory_msg, "🥳")
 
         # +1 к «победным играм» каждому участнику
         for uid in winners:
@@ -565,11 +549,8 @@ async def handle_endless_milestone(message, milestone):
         + mode_hint
     )
 
-    try:
-        await msg.add_reaction("🎉")
-        await msg.add_reaction("🏆")
-    except discord.Forbidden:
-        pass
+    await safe_add_reaction(msg, "🎉")
+    await safe_add_reaction(msg, "🏆")
 
 
 # ============================================================
