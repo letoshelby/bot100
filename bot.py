@@ -46,7 +46,8 @@ bot = commands.Bot(command_prefix="\u0000", intents=intents)
 # === СОСТОЯНИЕ СЧЁТА ===
 current_count = 0
 last_user_id = None
-participants = set()
+participants = set()             # общий список за забег
+milestone_participants = set()   # только текущий отрезок
 mode = MODE_CLASSIC
 milestones_reached = set()
 
@@ -90,6 +91,7 @@ def save_state():
         "current_count": current_count,
         "last_user_id": last_user_id,
         "participants": list(participants),
+        "milestone_participants": list(milestone_participants),
         "mode": mode,
         "milestones_reached": list(milestones_reached),
         "player_stats": player_stats,
@@ -110,7 +112,7 @@ async def save_state_async():
 
 
 def load_state():
-    global current_count, last_user_id, participants, mode, milestones_reached, player_stats, cur_streak
+    global current_count, last_user_id, participants, milestone_participants, mode, milestones_reached, player_stats, cur_streak
     if not os.path.exists(STATE_FILE):
         return
     try:
@@ -119,6 +121,7 @@ def load_state():
         current_count = data.get("current_count", 0)
         last_user_id = data.get("last_user_id")
         participants = set(data.get("participants", []))
+        milestone_participants = set(data.get("milestone_participants", []))
         mode = data.get("mode", MODE_CLASSIC)
         milestones_reached = set(data.get("milestones_reached", []))
         player_stats = data.get("player_stats", {})
@@ -128,10 +131,11 @@ def load_state():
 
 
 def reset_state():
-    global current_count, last_user_id, participants, milestones_reached, cur_streak
+    global current_count, last_user_id, participants, milestone_participants, milestones_reached, cur_streak
     current_count = 0
     last_user_id = None
     participants.clear()
+    milestone_participants.clear()
     milestones_reached.clear()
     cur_streak = 0
     save_state()
@@ -262,7 +266,7 @@ async def handle_count_message(message):
     if message.channel.id != CHANNEL_ID:
         return
 
-    global current_count, last_user_id, participants, cur_streak
+    global current_count, last_user_id, participants, milestone_participants, cur_streak
 
     content = message.content.strip()
     author_is_admin = is_admin(message.author)
@@ -277,7 +281,7 @@ async def handle_count_message(message):
             return
         try:
             await message.delete()
-        except discord.Forbidden:
+        except (discord.Forbidden, discord.NotFound):
             pass
         warning = await message.channel.send(
             f"{message.author.mention}, здесь нужно писать **только числа**! "
@@ -294,7 +298,7 @@ async def handle_count_message(message):
             return
         try:
             await message.delete()
-        except discord.Forbidden:
+        except (discord.Forbidden, discord.NotFound):
             pass
         warning = await message.channel.send(
             f"{message.author.mention}, нельзя считать дважды подряд! "
@@ -310,6 +314,7 @@ async def handle_count_message(message):
         current_count = number
         last_user_id = message.author.id
         participants.add(message.author.id)
+        milestone_participants.add(message.author.id)   # ← текущий отрезок
 
         # === Статистика ===
         st = get_stats(message.author.id)
@@ -357,6 +362,7 @@ async def handle_count_message(message):
             current_count = 0
             last_user_id = None
             participants.clear()
+            milestone_participants.clear()
             milestones_reached.clear()
             await save_state_async()
 
@@ -399,6 +405,7 @@ async def handle_count_message(message):
 
             current_count = rollback_to
             last_user_id = None
+            milestone_participants.clear()   # отрезок «обнулился» — начинаем новый
             await save_state_async()
 
             if not author_is_admin:
@@ -424,7 +431,11 @@ async def handle_count_message(message):
 #                    ВЫДАЧА РОЛИ
 # ============================================================
 
-async def give_role_to_participants(guild, reason: str):
+async def give_role_to_participants(guild, user_ids, reason: str):
+    """
+    Выдаёт роль ROLE_NAME участникам из user_ids.
+    Пропускает тех, у кого роль уже есть (честный success_count).
+    """
     role = discord.utils.get(guild.roles, name=ROLE_NAME)
     if role is None:
         return None, []
@@ -432,11 +443,13 @@ async def give_role_to_participants(guild, reason: str):
     success_count = 0
     failed = []
 
-    for user_id in list(participants):
+    for user_id in list(user_ids):
         member = guild.get_member(user_id)
         if member is None:
             failed.append(f"<@{user_id}>")
             continue
+        if role in member.roles:
+            continue   # роль уже есть — пропускаем
         try:
             await member.add_roles(role, reason=reason)
             success_count += 1
@@ -458,7 +471,9 @@ async def handle_classic_success(message):
     mentions = " ".join(f"<@{uid}>" for uid in winners) if winners else "—"
 
     try:
-        result = await give_role_to_participants(guild, "Досчитали до 100 (classic)")
+        result = await give_role_to_participants(
+            guild, participants, "Досчитали до 100 (classic)"
+        )
 
         if result[0] is None:
             await message.channel.send(
@@ -497,7 +512,6 @@ async def handle_classic_success(message):
         await safe_add_reaction(victory_msg, "🏆")
         await safe_add_reaction(victory_msg, "🥳")
 
-        # +1 к «победным играм» каждому участнику
         for uid in winners:
             get_stats(uid)["games"] += 1
 
@@ -510,10 +524,14 @@ async def handle_classic_success(message):
 
 async def handle_endless_milestone(message, milestone):
     guild = message.guild
-    mentions = " ".join(f"<@{uid}>" for uid in participants) or "—"
 
+    # снапшот текущего отрезка (для пинга и выдачи роли)
+    segment = list(milestone_participants)
+    mentions = " ".join(f"<@{uid}>" for uid in segment) if segment else "—"
+
+    # роль только за текущий отрезок (с пропуском тех, у кого уже есть)
     result = await give_role_to_participants(
-        guild, f"Достигли рубежа {milestone} (endless)"
+        guild, segment, f"Достигли рубежа {milestone}"
     )
 
     if result[0] is None:
@@ -521,6 +539,8 @@ async def handle_endless_milestone(message, milestone):
             f"🎯 Рубеж **{milestone}** достигнут! "
             f"(Роль **{ROLE_NAME}** не найдена, но это не важно — продолжаем!)"
         )
+        milestone_participants.clear()
+        save_state()
         return
 
     success_count, failed = result
@@ -541,16 +561,18 @@ async def handle_endless_milestone(message, milestone):
     msg = await message.channel.send(
         f"{random.choice(phrases)}\n\n"
         f"🎯 Достигнут рубеж **{milestone}**!\n\n"
-        f"🏆 **Участники цепочки:**\n{mentions}\n\n"
+        f"🏆 **Участники последнего отрезка:**\n{mentions}\n\n"
         f"👥 Участников: **{len(participants)}**\n"
-        f"🏅 Роль `{ROLE_NAME}` выдана: **{success_count}**"
-        + (f"\n⚠️ Не удалось выдать: {', '.join(failed)}" if failed else "")
-        + f"\n\n♾️ **Счёт продолжается — следующее число {milestone + 1}!**"
+        f"\n♾️ **Счёт продолжается — следующее число {milestone + 1}!**"
         + mode_hint
     )
 
     await safe_add_reaction(msg, "🎉")
     await safe_add_reaction(msg, "🏆")
+
+    # сбрасываем отрезок после рубежа
+    milestone_participants.clear()
+    save_state()
 
 
 # ============================================================
@@ -622,7 +644,7 @@ async def reset_count(interaction: discord.Interaction):
 async def set_count(interaction: discord.Interaction, number: int):
     global current_count, last_user_id
     current_count = number
-    last_user_id = None          # сброс, чтобы любой мог продолжить
+    last_user_id = None
     save_state()
     await interaction.response.send_message(
         f"✅ Счёт установлен на **{number}**. Следующее число — **{number + 1}**.",
@@ -643,6 +665,7 @@ async def count_status(interaction: discord.Interaction):
         f"Режим: **{MODE_NAMES.get(mode, mode)}**\n"
         f"Текущее число: **{current_count}**\n"
         f"Участников в цепочке: **{len(participants)}**\n"
+        f"Участников в отрезке: **{len(milestone_participants)}**\n"
         f"Рубеж: **{TARGET_COUNT}**\n"
         f"Следующее число: **{current_count + 1}**\n"
         f"Откат при ошибке: {rollback_hint}\n"
@@ -805,7 +828,6 @@ def handle_signal(sig, frame):
         loop = asyncio.get_running_loop()
         loop.create_task(shutdown())
     except RuntimeError:
-        # loop ещё не запущен — сохраняем синхронно
         save_state()
 
 
@@ -816,18 +838,15 @@ def handle_signal(sig, frame):
 if __name__ == "__main__":
     load_state()
 
-    # Регистрируем обработчики сигналов
     try:
         signal.signal(signal.SIGINT, handle_signal)
         signal.signal(signal.SIGTERM, handle_signal)
     except (ValueError, AttributeError):
-        # Windows / ограниченное окружение — пропускаем
         pass
 
     try:
         bot.run(TOKEN)
     except KeyboardInterrupt:
-        # Ctrl+C до запуска loop — сохраняем вручную
         print("\n🛑 Прервано пользователем. Сохраняю состояние...")
         save_state()
         print("💾 Состояние сохранено.")
