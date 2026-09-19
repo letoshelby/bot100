@@ -9,11 +9,15 @@ import signal
 import shutil
 import time
 import tempfile
+import sys
+
+# === ПРИНУДИТЕЛЬНЫЙ ВЫВОД В STDOUT (для Bothost) ===
+sys.stdout.reconfigure(line_buffering=True)
 
 # === НАСТРОЙКИ ===
 TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = 1547463400919928832        # ID канала #счет
-LOG_CHANNEL_ID = 1548649643275980840    # ID канала для логов смены режима
+LOG_CHANNEL_ID = 1548649643275980840    # ID канала для логов
 ROLE_NAME = "Счетовод"                  # Роль за победу/рубеж
 TOP1_ROLE_NAME = "Лучший счетовод"      # Роль за 1-е место в топе
 TOP1_ROLE_ENABLED = True                # Включить авто-выдачу роли топ-1
@@ -50,17 +54,18 @@ bot = commands.Bot(command_prefix="\u0000", intents=intents)
 # === СОСТОЯНИЕ СЧЁТА ===
 current_count = 0
 last_user_id = None
-participants = set()             # общий список за забег
-milestone_participants = set()   # только текущий отрезок
+participants = set()
+milestone_participants = set()
 mode = MODE_CLASSIC
 milestones_reached = set()
 
 # === СТАТИСТИКА ===
-player_stats = {}   # {str(user_id): {"score": int, "best_streak": int, "broken": int, "games": int}}
-cur_streak = 0      # текущая серия (сохраняется между рестартами)
+player_stats = {}
+cur_streak = 0
 
-# === ДЛЯ ЛОГИРОВАНИЯ ИЗМЕНЕНИЙ STATE ===
+# === ДЛЯ ЛОГИРОВАНИЯ ===
 _last_state = {}
+_load_error = None
 
 
 # ============================================================
@@ -74,7 +79,6 @@ def is_admin(member: discord.Member) -> bool:
 
 
 def get_stats(user_id: int) -> dict:
-    """Возвращает (и создаёт при необходимости) статистику игрока."""
     key = str(user_id)
     if key not in player_stats:
         player_stats[key] = {"score": 0, "best_streak": 0, "broken": 0, "games": 0}
@@ -82,11 +86,22 @@ def get_stats(user_id: int) -> dict:
 
 
 async def safe_add_reaction(message: discord.Message, emoji: str):
-    """Ставит реакцию, игнорируя Forbidden и NotFound."""
     try:
         await message.add_reaction(emoji)
     except (discord.Forbidden, discord.NotFound):
         pass
+
+
+async def log_to_channel(text: str):
+    """Отправляет сообщение в канал логов. Игнорирует ошибки."""
+    try:
+        channel = bot.get_channel(LOG_CHANNEL_ID)
+        if channel is None:
+            print(f"⚠️ Канал логов {LOG_CHANNEL_ID} не найден.")
+            return
+        await channel.send(text)
+    except Exception as e:
+        print(f"⚠️ Не удалось отправить лог в канал: {e}")
 
 
 # ============================================================
@@ -107,7 +122,7 @@ def save_state():
         "cur_streak": cur_streak,
     }
 
-    # --- логирование изменений ключевых полей ---
+    # логирование изменений
     changed = []
     for key in ("current_count", "mode", "cur_streak"):
         old = _last_state.get(key)
@@ -121,11 +136,10 @@ def save_state():
         if old_len != new_len:
             changed.append(f"{key}: {old_len} → {new_len}")
         _last_state[key + "_len"] = new_len
-
     if changed:
         print(f"💾 save_state: {' | '.join(changed)}")
 
-    # --- уникальный временный файл + атомарная замена ---
+    # уникальный временный файл + атомарная замена
     dir_ = os.path.dirname(os.path.abspath(STATE_FILE)) or "."
     tmp_path = None
     try:
@@ -133,7 +147,7 @@ def save_state():
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         os.replace(tmp_path, STATE_FILE)
-        tmp_path = None   # успешно заменён — удалять не надо
+        tmp_path = None
     except Exception as e:
         print(f"⚠️ Не удалось сохранить состояние: {e}")
     finally:
@@ -145,12 +159,11 @@ def save_state():
 
 
 async def save_state_async():
-    """Не блокирует event loop — пишет файл в отдельном потоке."""
     await asyncio.to_thread(save_state)
 
 
 def load_state():
-    global current_count, last_user_id, participants, milestone_participants, mode, milestones_reached, player_stats, cur_streak
+    global current_count, last_user_id, participants, milestone_participants, mode, milestones_reached, player_stats, cur_streak, _load_error
 
     if not os.path.exists(STATE_FILE):
         print("ℹ️ state.json не найден — стартуем с дефолтными значениями.")
@@ -170,34 +183,38 @@ def load_state():
         cur_streak = data.get("cur_streak", 0)
 
         print(
-            f"💾 state.json загружен: "
-            f"счёт={current_count}, режим={mode}, "
-            f"рубежей={len(milestones_reached)}, "
-            f"игроков={len(player_stats)}, "
-            f"участников={len(participants)}, "
-            f"отрезок={len(milestone_participants)}, "
+            f"💾 state.json загружен: счёт={current_count}, режим={mode}, "
+            f"рубежей={len(milestones_reached)}, игроков={len(player_stats)}, "
+            f"участников={len(participants)}, отрезок={len(milestone_participants)}, "
             f"стрик={cur_streak}"
         )
 
+        if mode == MODE_CLASSIC and current_count > 150:
+            print(
+                f"⚠️ ВНИМАНИЕ: режим classic, но счёт = {current_count}. "
+                f"Возможно, режим должен быть endless/endless_soft."
+            )
+
         if current_count == 0 and not milestones_reached and not participants and not player_stats:
-            print("⚠️ ВНИМАНИЕ: state.json полностью пустой. "
-                  "Если это не первый запуск — возможно, файл был перезаписан дефолтом.")
+            print("⚠️ ВНИМАНИЕ: state.json полностью пустой.")
 
     except Exception as e:
         print(f"❌ КРИТИЧНО: не удалось загрузить state.json: {e}")
         print("⚠️ Бот стартует с ДЕФОЛТНЫМИ значениями (mode=classic, счёт=0)!")
-
-        # сохраняем битый файл, чтобы можно было восстановить вручную
+        _load_error = (
+            f"❌ **КРИТИЧНО: не удалось загрузить state.json**\n"
+            f"Ошибка: `{e}`\n"
+            f"Бот стартует с дефолтными значениями (mode=classic, счёт=0)."
+        )
         try:
             backup = f"state.broken.{int(time.time())}.json"
             shutil.copy(STATE_FILE, backup)
-            print(f"💾 Битый файл сохранён как {backup} — можешь восстановить вручную.")
+            print(f"💾 Битый файл сохранён как {backup}")
         except Exception as e2:
             print(f"⚠️ Не удалось сохранить бэкап: {e2}")
 
 
 def reset_state():
-    """Синхронный сброс (для shutdown / редких случаев)."""
     global current_count, last_user_id, participants, milestone_participants, milestones_reached, cur_streak
     current_count = 0
     last_user_id = None
@@ -209,7 +226,6 @@ def reset_state():
 
 
 async def reset_state_async():
-    """Асинхронный сброс — не блокирует event loop."""
     global current_count, last_user_id, participants, milestone_participants, milestones_reached, cur_streak
     current_count = 0
     last_user_id = None
@@ -225,7 +241,6 @@ async def reset_state_async():
 # ============================================================
 
 def get_top1_user_id():
-    """Возвращает ID игрока на 1-м месте или None, если статистики нет."""
     if not player_stats:
         return None
     sorted_players = sorted(
@@ -240,10 +255,6 @@ def get_top1_user_id():
 
 
 async def update_top1_role(guild: discord.Guild):
-    """
-    Синхронизирует роль TOP1_ROLE_NAME с текущим лидером топа.
-    Выдаёт новому лидеру, снимает со старого.
-    """
     if not TOP1_ROLE_ENABLED:
         return
     if guild is None:
@@ -256,7 +267,6 @@ async def update_top1_role(guild: discord.Guild):
     top_id = get_top1_user_id()
     current_holders = [m for m in role.members]
 
-    # Лидера нет — снимаем роль со всех
     if top_id is None:
         for m in current_holders:
             try:
@@ -265,13 +275,11 @@ async def update_top1_role(guild: discord.Guild):
                 pass
         return
 
-    # Лидер уже носит роль и он один — ничего не делаем
     if len(current_holders) == 1 and current_holders[0].id == top_id:
         return
 
     new_leader = guild.get_member(top_id)
     if new_leader is None:
-        # Лидер вышел с сервера — снимаем роль со всех
         for m in current_holders:
             try:
                 await m.remove_roles(role, reason="Топ-1: лидер покинул сервер")
@@ -279,7 +287,6 @@ async def update_top1_role(guild: discord.Guild):
                 pass
         return
 
-    # Снимаем со всех, кроме нового лидера
     for m in current_holders:
         if m.id != top_id:
             try:
@@ -287,7 +294,6 @@ async def update_top1_role(guild: discord.Guild):
             except discord.Forbidden:
                 pass
 
-    # Выдаём новому лидеру (если ещё нет)
     if role not in new_leader.roles:
         try:
             await new_leader.add_roles(role, reason="Топ-1: вышел на 1-е место")
@@ -309,7 +315,6 @@ async def on_ready():
     print(f"👑 Админы могут считать: {ADMINS_CAN_COUNT}")
     print(f"🏆 Роль топ-1: {TOP1_ROLE_NAME if TOP1_ROLE_ENABLED else 'отключена'}")
 
-    # Синхронизируем роль топ-1 со статистикой на старте
     for guild in bot.guilds:
         try:
             await update_top1_role(guild)
@@ -328,6 +333,19 @@ async def on_ready():
     except Exception as e:
         print(f"⚠️ Ошибка синхронизации команд: {e}")
 
+    # === ЛОГ СТАРТА В КАНАЛ ===
+    if _load_error:
+        await log_to_channel(_load_error)
+
+    await log_to_channel(
+        f"🚀 **Бот запущен**\n"
+        f"🎮 Режим: **{MODE_NAMES.get(mode, mode)}**\n"
+        f"🔢 Счёт: **{current_count}**\n"
+        f"🎯 Рубежей пройдено: **{len(milestones_reached)}**\n"
+        f"👥 Участников в забеге: **{len(participants)}**\n"
+        f"📊 Игроков в статистике: **{len(player_stats)}**"
+    )
+
 
 @bot.event
 async def on_message(message):
@@ -336,6 +354,34 @@ async def on_message(message):
 
     await handle_count_message(message)
     await bot.process_commands(message)
+
+
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    """Реакция на редактирование сообщения в канале счёта."""
+    if after.author.bot:
+        return
+    if after.channel.id != CHANNEL_ID:
+        return
+    if before.content == after.content:
+        return
+
+    # Игнорируем админов, если им разрешено считать без правил
+    author_is_admin = is_admin(after.author)
+    if author_is_admin and not ADMINS_CAN_COUNT:
+        return
+
+    # Редактирование числа в канале счёта — удаляем сообщение
+    try:
+        await after.delete()
+    except (discord.Forbidden, discord.NotFound):
+        pass
+
+    warning = await after.channel.send(
+        f"{after.author.mention}, редактировать сообщения в канале счёта нельзя! "
+        f"Сообщение удалено."
+    )
+    await warning.delete(delay=5)
 
 
 # ============================================================
@@ -351,11 +397,9 @@ async def handle_count_message(message):
     content = message.content.strip()
     author_is_admin = is_admin(message.author)
 
-    # === Админ, а режим "не считать" — игнорируем ===
     if author_is_admin and not ADMINS_CAN_COUNT:
         return
 
-    # === Не число ===
     if not content.isdigit():
         if author_is_admin:
             return
@@ -372,7 +416,6 @@ async def handle_count_message(message):
 
     number = int(content)
 
-    # === Нельзя считать дважды подряд ===
     if message.author.id == last_user_id:
         if author_is_admin:
             return
@@ -396,7 +439,6 @@ async def handle_count_message(message):
         participants.add(message.author.id)
         milestone_participants.add(message.author.id)
 
-        # === Статистика ===
         st = get_stats(message.author.id)
         st["score"] += 1
         cur_streak += 1
@@ -405,7 +447,6 @@ async def handle_count_message(message):
 
         await save_state_async()
 
-        # === Роль топ-1 ===
         if TOP1_ROLE_ENABLED and message.guild:
             try:
                 await update_top1_role(message.guild)
@@ -418,7 +459,6 @@ async def handle_count_message(message):
             if current_count == TARGET_COUNT:
                 await handle_classic_success(message)
                 return
-
         elif mode in (MODE_ENDLESS, MODE_ENDLESS_SOFT):
             if current_count % TARGET_COUNT == 0:
                 milestone = current_count
@@ -433,11 +473,21 @@ async def handle_count_message(message):
     else:
         broken_at = current_count
 
+        # === ЛОГ ОШИБКИ В КАНАЛ ===
+        await log_to_channel(
+            f"❌ **Ошибка в счёте**\n"
+            f"👤 Кто: {message.author.mention} (`{message.author.id}`)\n"
+            f"✍️ Написал: **{number}**\n"
+            f"🎯 Ждали: **{expected}**\n"
+            f"🎮 Режим: **{MODE_NAMES.get(mode, mode)}**\n"
+            f"🔢 Счёт до ошибки: **{broken_at}**\n"
+            f"🔥 Стрик: **{cur_streak}**"
+        )
+
         if not author_is_admin:
             get_stats(message.author.id)["broken"] += 1
         cur_streak = 0
 
-        # ---------------- CLASSIC ----------------
         if mode == MODE_CLASSIC:
             current_count = 0
             last_user_id = None
@@ -465,7 +515,6 @@ async def handle_count_message(message):
             )
             await safe_add_reaction(fail_msg, "😡")
 
-        # ---------------- ENDLESS ----------------
         elif mode == MODE_ENDLESS:
             if not author_is_admin:
                 await safe_add_reaction(message, "❌")
@@ -478,7 +527,6 @@ async def handle_count_message(message):
             )
             await safe_add_reaction(fail_msg, "🤔")
 
-        # ---------------- ENDLESS_SOFT ----------------
         elif mode == MODE_ENDLESS_SOFT:
             rollback_to = (broken_at // TARGET_COUNT) * TARGET_COUNT
             lost = broken_at - rollback_to
@@ -512,10 +560,6 @@ async def handle_count_message(message):
 # ============================================================
 
 async def give_role_to_participants(guild, user_ids, reason: str):
-    """
-    Выдаёт роль ROLE_NAME участникам из user_ids.
-    Пропускает тех, у кого роль уже есть (честный success_count).
-    """
     role = discord.utils.get(guild.roles, name=ROLE_NAME)
     if role is None:
         return None, []
@@ -529,7 +573,7 @@ async def give_role_to_participants(guild, user_ids, reason: str):
             failed.append(f"<@{user_id}>")
             continue
         if role in member.roles:
-            continue   # роль уже есть — пропускаем
+            continue
         try:
             await member.add_roles(role, reason=reason)
             success_count += 1
@@ -557,8 +601,7 @@ async def handle_classic_success(message):
 
         if result[0] is None:
             await message.channel.send(
-                f"⚠️ Роль **{ROLE_NAME}** не найдена на сервере. "
-                f"Создайте её или измените ROLE_NAME в настройках бота."
+                f"⚠️ Роль **{ROLE_NAME}** не найдена на сервере."
             )
             return
 
@@ -595,6 +638,15 @@ async def handle_classic_success(message):
         for uid in winners:
             get_stats(uid)["games"] += 1
 
+        # === ЛОГ ПОБЕДЫ В КАНАЛ ===
+        await log_to_channel(
+            f"🏆 **ПОБЕДА в classic!**\n"
+            f"🎯 Цепочка 1 → {TARGET_COUNT} пройдена\n"
+            f"👥 Участников: **{len(winners)}**\n"
+            f"🏅 Роль выдана: **{success_count}**"
+            + (f"\n⚠️ Не удалось выдать: {len(failed)}" if failed else "")
+        )
+
     except Exception as e:
         print(f"⚠️ Ошибка при обработке победы: {e}")
 
@@ -605,11 +657,9 @@ async def handle_classic_success(message):
 async def handle_endless_milestone(message, milestone):
     guild = message.guild
 
-    # снапшот текущего отрезка (для пинга и выдачи роли)
     segment = list(milestone_participants)
     mentions = " ".join(f"<@{uid}>" for uid in segment) if segment else "—"
 
-    # роль только за текущий отрезок (с пропуском тех, у кого уже есть)
     result = await give_role_to_participants(
         guild, segment, f"Достигли рубежа {milestone}"
     )
@@ -650,7 +700,16 @@ async def handle_endless_milestone(message, milestone):
     await safe_add_reaction(msg, "🎉")
     await safe_add_reaction(msg, "🏆")
 
-    # сбрасываем отрезок после рубежа
+    # === ЛОГ РУБЕЖА В КАНАЛ ===
+    await log_to_channel(
+        f"🎯 **Достигнут рубеж {milestone}**\n"
+        f"🎮 Режим: **{MODE_NAMES.get(mode, mode)}**\n"
+        f"👥 В отрезке: **{len(segment)}**\n"
+        f"👥 Всего в забеге: **{len(participants)}**\n"
+        f"🏅 Роль выдана: **{success_count}**"
+        + (f"\n⚠️ Не удалось выдать: {len(failed)}" if failed else "")
+    )
+
     milestone_participants.clear()
     await save_state_async()
 
@@ -693,24 +752,15 @@ async def change_mode(
     else:
         await save_state_async()
 
-    # --- логирование в канал ---
-    log_channel = bot.get_channel(LOG_CHANNEL_ID)
-    if log_channel:
-        try:
-            await log_channel.send(
-                f"⚙️ **Смена режима**\n"
-                f"👤 Кто: {interaction.user.mention} (`{interaction.user.id}`)\n"
-                f"🔁 Было: **{MODE_NAMES[old_mode]}**\n"
-                f"➡️ Стало: **{MODE_NAMES[mode]}**\n"
-                f"🔄 Сброс счёта: **{'да' if reset else 'нет'}**\n"
-                f"📊 Текущий счёт: **{current_count}**"
-            )
-        except Exception as e:
-            print(f"⚠️ Не удалось отправить лог смены режима: {e}")
-    else:
-        print(f"⚠️ Канал логов {LOG_CHANNEL_ID} не найден или недоступен.")
+    await log_to_channel(
+        f"⚙️ **Смена режима**\n"
+        f"👤 Кто: {interaction.user.mention} (`{interaction.user.id}`)\n"
+        f"🔁 Было: **{MODE_NAMES[old_mode]}**\n"
+        f"➡️ Стало: **{MODE_NAMES[mode]}**\n"
+        f"🔄 Сброс счёта: **{'да' if reset else 'нет'}**\n"
+        f"📊 Текущий счёт: **{current_count}**"
+    )
 
-    # --- ответ пользователю ---
     if new_mode.value == old_mode:
         await interaction.response.send_message(
             f"🔄 Счёт сброшен. Режим остался прежним: **{MODE_NAMES[mode]}**\n"
@@ -729,10 +779,16 @@ async def change_mode(
 @bot.tree.command(name="reset_count", description="Сбросить счёт вручную")
 @app_commands.default_permissions(administrator=True)
 async def reset_count(interaction: discord.Interaction):
+    old_count = current_count
     await reset_state_async()
     await interaction.response.send_message(
         "🔄 Счёт сброшен вручную. Начинаем с **1**.",
         ephemeral=False,
+    )
+    await log_to_channel(
+        f"🛠 **Ручной сброс счёта**\n"
+        f"👤 Кто: {interaction.user.mention} (`{interaction.user.id}`)\n"
+        f"🔢 Было: **{old_count}** → **0**"
     )
 
 
@@ -741,12 +797,18 @@ async def reset_count(interaction: discord.Interaction):
 @app_commands.default_permissions(administrator=True)
 async def set_count(interaction: discord.Interaction, number: int):
     global current_count, last_user_id
+    old_count = current_count
     current_count = number
     last_user_id = None
     await save_state_async()
     await interaction.response.send_message(
         f"✅ Счёт установлен на **{number}**. Следующее число — **{number + 1}**.",
         ephemeral=False,
+    )
+    await log_to_channel(
+        f"🛠 **Ручная установка счёта**\n"
+        f"👤 Кто: {interaction.user.mention} (`{interaction.user.id}`)\n"
+        f"🔢 Было: **{old_count}** → **{number}**"
     )
 
 
@@ -816,138 +878,3 @@ async def stats(interaction: discord.Interaction, user: discord.Member = None):
     )
     embed.set_thumbnail(url=target.display_avatar.url)
     embed.add_field(name="🏅 Баллы", value=f"**{total_score}**", inline=True)
-    embed.add_field(
-        name="🏆 Место в топе",
-        value=f"**#{rank}**" if rank else "—",
-        inline=True,
-    )
-    embed.add_field(name="🔥 Лучший стрик", value=f"**{best}**", inline=True)
-    embed.add_field(name="💥 Сломал цепочек", value=f"**{broken}**", inline=True)
-    embed.add_field(name="🎮 Победных игр", value=f"**{games}**", inline=True)
-    embed.add_field(name="🎯 Точность", value=f"**{accuracy:.1f}%**", inline=True)
-    embed.set_footer(text=f"ID: {target.id}")
-
-    await interaction.response.send_message(embed=embed)
-
-
-@bot.tree.command(name="top", description="Топ-10 лучших счетоводов")
-async def top(interaction: discord.Interaction):
-    if not player_stats:
-        await interaction.response.send_message(
-            "📭 Пока никто не набрал баллов.", ephemeral=True
-        )
-        return
-
-    sorted_players = sorted(
-        player_stats.items(),
-        key=lambda kv: (kv[1].get("score", 0), kv[1].get("best_streak", 0)),
-        reverse=True,
-    )[:10]
-
-    medals = ["🥇", "🥈", "🥉"]
-    lines = []
-    for i, (uid, st) in enumerate(sorted_players):
-        prefix = medals[i] if i < 3 else f"`#{i + 1}`"
-        member = interaction.guild.get_member(int(uid)) if interaction.guild else None
-        name = member.display_name if member else f"<@{uid}>"
-        lines.append(
-            f"{prefix} **{name}** — `{st.get('score', 0)}` баллов "
-            f"(стрик: {st.get('best_streak', 0)})"
-        )
-
-    embed = discord.Embed(
-        title="🏆 Топ-10 счетоводов",
-        description="\n".join(lines),
-        color=discord.Color.gold(),
-    )
-
-    await interaction.response.send_message(embed=embed)
-
-
-@bot.tree.command(name="update_top_role", description="Пересчитать роль топ-1 вручную")
-@app_commands.default_permissions(administrator=True)
-async def update_top_role(interaction: discord.Interaction):
-    if not TOP1_ROLE_ENABLED:
-        await interaction.response.send_message(
-            "⚠️ Авто-выдача роли топ-1 отключена (TOP1_ROLE_ENABLED = False).",
-            ephemeral=True,
-        )
-        return
-
-    role = discord.utils.get(interaction.guild.roles, name=TOP1_ROLE_NAME)
-    if role is None:
-        await interaction.response.send_message(
-            f"⚠️ Роль **{TOP1_ROLE_NAME}** не найдена на сервере. "
-            f"Создайте её или измените TOP1_ROLE_NAME в настройках.",
-            ephemeral=True,
-        )
-        return
-
-    await update_top1_role(interaction.guild)
-
-    top_id = get_top1_user_id()
-    if top_id is None:
-        await interaction.response.send_message(
-            "🔄 Роль топ-1 пересчитана. Лидера пока нет — роль снята со всех.",
-            ephemeral=True,
-        )
-    else:
-        await interaction.response.send_message(
-            f"🔄 Роль топ-1 пересчитана. Лидер: <@{top_id}>",
-            ephemeral=True,
-        )
-
-
-# ============================================================
-#                    GRACEFUL SHUTDOWN
-# ============================================================
-
-async def shutdown():
-    """Аккуратно сохраняет состояние и закрывает бота."""
-    print("\n🛑 Завершение работы. Сохраняю состояние...")
-    try:
-        save_state()
-        print("💾 Состояние сохранено.")
-    except Exception as e:
-        print(f"⚠️ Не удалось сохранить состояние: {e}")
-
-    try:
-        await bot.close()
-        print("🔌 Соединение с Discord закрыто.")
-    except Exception as e:
-        print(f"⚠️ Ошибка при закрытии: {e}")
-
-
-def handle_signal(sig, frame):
-    """Обработчик SIGINT/SIGTERM — запускает shutdown в event loop."""
-    name = sig.name if hasattr(sig, "name") else str(sig)
-    print(f"\n📴 Получен сигнал {name}")
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(shutdown())
-    except RuntimeError:
-        save_state()
-
-
-# ============================================================
-#                    ЗАПУСК
-# ============================================================
-
-if __name__ == "__main__":
-    load_state()
-
-    try:
-        signal.signal(signal.SIGINT, handle_signal)
-        signal.signal(signal.SIGTERM, handle_signal)
-    except (ValueError, AttributeError):
-        pass
-
-    try:
-        bot.run(TOKEN)
-    except KeyboardInterrupt:
-        print("\n🛑 Прервано пользователем. Сохраняю состояние...")
-        save_state()
-        print("💾 Состояние сохранено.")
-    except Exception as e:
-        print(f"❌ Ошибка: {e}")
-        save_state()
