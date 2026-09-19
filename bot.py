@@ -122,7 +122,6 @@ def save_state():
         "cur_streak": cur_streak,
     }
 
-    # логирование изменений
     changed = []
     for key in ("current_count", "mode", "cur_streak"):
         old = _last_state.get(key)
@@ -139,7 +138,6 @@ def save_state():
     if changed:
         print(f"💾 save_state: {' | '.join(changed)}")
 
-    # уникальный временный файл + атомарная замена
     dir_ = os.path.dirname(os.path.abspath(STATE_FILE)) or "."
     tmp_path = None
     try:
@@ -333,7 +331,6 @@ async def on_ready():
     except Exception as e:
         print(f"⚠️ Ошибка синхронизации команд: {e}")
 
-    # === ЛОГ СТАРТА В КАНАЛ ===
     if _load_error:
         await log_to_channel(_load_error)
 
@@ -366,12 +363,10 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
     if before.content == after.content:
         return
 
-    # Игнорируем админов, если им разрешено считать без правил
     author_is_admin = is_admin(after.author)
     if author_is_admin and not ADMINS_CAN_COUNT:
         return
 
-    # Редактирование числа в канале счёта — удаляем сообщение
     try:
         await after.delete()
     except (discord.Forbidden, discord.NotFound):
@@ -473,7 +468,6 @@ async def handle_count_message(message):
     else:
         broken_at = current_count
 
-        # === ЛОГ ОШИБКИ В КАНАЛ ===
         await log_to_channel(
             f"❌ **Ошибка в счёте**\n"
             f"👤 Кто: {message.author.mention} (`{message.author.id}`)\n"
@@ -638,7 +632,6 @@ async def handle_classic_success(message):
         for uid in winners:
             get_stats(uid)["games"] += 1
 
-        # === ЛОГ ПОБЕДЫ В КАНАЛ ===
         await log_to_channel(
             f"🏆 **ПОБЕДА в classic!**\n"
             f"🎯 Цепочка 1 → {TARGET_COUNT} пройдена\n"
@@ -700,7 +693,6 @@ async def handle_endless_milestone(message, milestone):
     await safe_add_reaction(msg, "🎉")
     await safe_add_reaction(msg, "🏆")
 
-    # === ЛОГ РУБЕЖА В КАНАЛ ===
     await log_to_channel(
         f"🎯 **Достигнут рубеж {milestone}**\n"
         f"🎮 Режим: **{MODE_NAMES.get(mode, mode)}**\n"
@@ -878,3 +870,136 @@ async def stats(interaction: discord.Interaction, user: discord.Member = None):
     )
     embed.set_thumbnail(url=target.display_avatar.url)
     embed.add_field(name="🏅 Баллы", value=f"**{total_score}**", inline=True)
+    embed.add_field(
+        name="🏆 Место в топе",
+        value=f"**#{rank}**" if rank else "—",
+        inline=True,
+    )
+    embed.add_field(name="🔥 Лучший стрик", value=f"**{best}**", inline=True)
+    embed.add_field(name="💥 Сломал цепочек", value=f"**{broken}**", inline=True)
+    embed.add_field(name="🎮 Победных игр", value=f"**{games}**", inline=True)
+    embed.add_field(name="🎯 Точность", value=f"**{accuracy:.1f}%**", inline=True)
+    embed.set_footer(text=f"ID: {target.id}")
+
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="top", description="Топ-10 лучших счетоводов")
+async def top(interaction: discord.Interaction):
+    if not player_stats:
+        await interaction.response.send_message(
+            "📭 Пока никто не набрал баллов.", ephemeral=True
+        )
+        return
+
+    sorted_players = sorted(
+        player_stats.items(),
+        key=lambda kv: (kv[1].get("score", 0), kv[1].get("best_streak", 0)),
+        reverse=True,
+    )[:10]
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, (uid, st) in enumerate(sorted_players):
+        prefix = medals[i] if i < 3 else f"`#{i + 1}`"
+        member = interaction.guild.get_member(int(uid)) if interaction.guild else None
+        name = member.display_name if member else f"<@{uid}>"
+        lines.append(
+            f"{prefix} **{name}** — `{st.get('score', 0)}` баллов "
+            f"(стрик: {st.get('best_streak', 0)})"
+        )
+
+    embed = discord.Embed(
+        title="🏆 Топ-10 счетоводов",
+        description="\n".join(lines),
+        color=discord.Color.gold(),
+    )
+
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="update_top_role", description="Пересчитать роль топ-1 вручную")
+@app_commands.default_permissions(administrator=True)
+async def update_top_role(interaction: discord.Interaction):
+    if not TOP1_ROLE_ENABLED:
+        await interaction.response.send_message(
+            "⚠️ Авто-выдача роли топ-1 отключена (TOP1_ROLE_ENABLED = False).",
+            ephemeral=True,
+        )
+        return
+
+    role = discord.utils.get(interaction.guild.roles, name=TOP1_ROLE_NAME)
+    if role is None:
+        await interaction.response.send_message(
+            f"⚠️ Роль **{TOP1_ROLE_NAME}** не найдена на сервере. "
+            f"Создайте её или измените TOP1_ROLE_NAME в настройках.",
+            ephemeral=True,
+        )
+        return
+
+    await update_top1_role(interaction.guild)
+
+    top_id = get_top1_user_id()
+    if top_id is None:
+        await interaction.response.send_message(
+            "🔄 Роль топ-1 пересчитана. Лидера пока нет — роль снята со всех.",
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message(
+            f"🔄 Роль топ-1 пересчитана. Лидер: <@{top_id}>",
+            ephemeral=True,
+        )
+
+
+# ============================================================
+#                    GRACEFUL SHUTDOWN
+# ============================================================
+
+async def shutdown():
+    print("\n🛑 Завершение работы. Сохраняю состояние...")
+    try:
+        save_state()
+        print("💾 Состояние сохранено.")
+    except Exception as e:
+        print(f"⚠️ Не удалось сохранить состояние: {e}")
+
+    try:
+        await bot.close()
+        print("🔌 Соединение с Discord закрыто.")
+    except Exception as e:
+        print(f"⚠️ Ошибка при закрытии: {e}")
+
+
+def handle_signal(sig, frame):
+    name = sig.name if hasattr(sig, "name") else str(sig)
+    print(f"\n📴 Получен сигнал {name}")
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(shutdown())
+    except RuntimeError:
+        save_state()
+
+
+# ============================================================
+#                    ЗАПУСК
+# ============================================================
+
+if __name__ == "__main__":
+    load_state()
+
+    try:
+        signal.signal(signal.SIGINT, handle_signal)
+        signal.signal(signal.SIGTERM, handle_signal)
+    except (ValueError, AttributeError):
+        pass
+
+    try:
+        bot.run(TOKEN)
+    except KeyboardInterrupt:
+        print("\n🛑 Прервано пользователем. Сохраняю состояние...")
+        save_state()
+        print("💾 Состояние сохранено.")
+    except Exception as e:
+        print(f"❌ Ошибка: {e}")
+        save_state()
