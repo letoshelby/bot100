@@ -6,19 +6,23 @@ import os
 import json
 import asyncio
 import signal
+import shutil
+import time
+import tempfile
 
 # === НАСТРОЙКИ ===
 TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_ID = 1547463400919928832   # ID канала #счет
-ROLE_NAME = "Счетовод"             # Роль за победу/рубеж
-TOP1_ROLE_NAME = "Лучший счетовод" # Роль за 1-е место в топе
-TOP1_ROLE_ENABLED = True           # Включить авто-выдачу роли топ-1
-TARGET_COUNT = 100                 # До скольких считаем (классический режим и рубеж)
-STATE_FILE = "state.json"          # Файл для сохранения состояния
-MAX_MILESTONES = 50                # Сколько последних рубежей хранить (endless)
+CHANNEL_ID = 1547463400919928832        # ID канала #счет
+LOG_CHANNEL_ID = 1548649643275980840    # ID канала для логов смены режима
+ROLE_NAME = "Счетовод"                  # Роль за победу/рубеж
+TOP1_ROLE_NAME = "Лучший счетовод"      # Роль за 1-е место в топе
+TOP1_ROLE_ENABLED = True                # Включить авто-выдачу роли топ-1
+TARGET_COUNT = 100                      # До скольких считаем (классический режим и рубеж)
+STATE_FILE = "state.json"               # Файл для сохранения состояния
+MAX_MILESTONES = 50                     # Сколько последних рубежей хранить (endless)
 
 # ID сервера для мгновенной синхронизации слэш-команд (None = глобально, до 1 часа)
-GUILD_ID = None                    # например: 123456789012345678
+GUILD_ID = None                         # например: 123456789012345678
 
 # Могут ли админы участвовать в счёте?
 ADMINS_CAN_COUNT = True
@@ -55,6 +59,9 @@ milestones_reached = set()
 player_stats = {}   # {str(user_id): {"score": int, "best_streak": int, "broken": int, "games": int}}
 cur_streak = 0      # текущая серия (сохраняется между рестартами)
 
+# === ДЛЯ ЛОГИРОВАНИЯ ИЗМЕНЕНИЙ STATE ===
+_last_state = {}
+
 
 # ============================================================
 #                    ХЕЛПЕРЫ
@@ -87,6 +94,8 @@ async def safe_add_reaction(message: discord.Message, emoji: str):
 # ============================================================
 
 def save_state():
+    global _last_state
+
     data = {
         "current_count": current_count,
         "last_user_id": last_user_id,
@@ -97,13 +106,42 @@ def save_state():
         "player_stats": player_stats,
         "cur_streak": cur_streak,
     }
-    tmp = STATE_FILE + ".tmp"
+
+    # --- логирование изменений ключевых полей ---
+    changed = []
+    for key in ("current_count", "mode", "cur_streak"):
+        old = _last_state.get(key)
+        new = data[key]
+        if old != new:
+            changed.append(f"{key}: {old} → {new}")
+        _last_state[key] = new
+    for key in ("participants", "milestone_participants", "milestones_reached"):
+        old_len = _last_state.get(key + "_len")
+        new_len = len(data[key])
+        if old_len != new_len:
+            changed.append(f"{key}: {old_len} → {new_len}")
+        _last_state[key + "_len"] = new_len
+
+    if changed:
+        print(f"💾 save_state: {' | '.join(changed)}")
+
+    # --- уникальный временный файл + атомарная замена ---
+    dir_ = os.path.dirname(os.path.abspath(STATE_FILE)) or "."
+    tmp_path = None
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
+        fd, tmp_path = tempfile.mkstemp(dir=dir_, prefix="state_", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, STATE_FILE)   # атомарная запись
+        os.replace(tmp_path, STATE_FILE)
+        tmp_path = None   # успешно заменён — удалять не надо
     except Exception as e:
         print(f"⚠️ Не удалось сохранить состояние: {e}")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
 
 async def save_state_async():
@@ -113,11 +151,15 @@ async def save_state_async():
 
 def load_state():
     global current_count, last_user_id, participants, milestone_participants, mode, milestones_reached, player_stats, cur_streak
+
     if not os.path.exists(STATE_FILE):
+        print("ℹ️ state.json не найден — стартуем с дефолтными значениями.")
         return
+
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
+
         current_count = data.get("current_count", 0)
         last_user_id = data.get("last_user_id")
         participants = set(data.get("participants", []))
@@ -126,11 +168,36 @@ def load_state():
         milestones_reached = set(data.get("milestones_reached", []))
         player_stats = data.get("player_stats", {})
         cur_streak = data.get("cur_streak", 0)
+
+        print(
+            f"💾 state.json загружен: "
+            f"счёт={current_count}, режим={mode}, "
+            f"рубежей={len(milestones_reached)}, "
+            f"игроков={len(player_stats)}, "
+            f"участников={len(participants)}, "
+            f"отрезок={len(milestone_participants)}, "
+            f"стрик={cur_streak}"
+        )
+
+        if current_count == 0 and not milestones_reached and not participants and not player_stats:
+            print("⚠️ ВНИМАНИЕ: state.json полностью пустой. "
+                  "Если это не первый запуск — возможно, файл был перезаписан дефолтом.")
+
     except Exception as e:
-        print(f"⚠️ Не удалось загрузить состояние: {e}")
+        print(f"❌ КРИТИЧНО: не удалось загрузить state.json: {e}")
+        print("⚠️ Бот стартует с ДЕФОЛТНЫМИ значениями (mode=classic, счёт=0)!")
+
+        # сохраняем битый файл, чтобы можно было восстановить вручную
+        try:
+            backup = f"state.broken.{int(time.time())}.json"
+            shutil.copy(STATE_FILE, backup)
+            print(f"💾 Битый файл сохранён как {backup} — можешь восстановить вручную.")
+        except Exception as e2:
+            print(f"⚠️ Не удалось сохранить бэкап: {e2}")
 
 
 def reset_state():
+    """Синхронный сброс (для shutdown / редких случаев)."""
     global current_count, last_user_id, participants, milestone_participants, milestones_reached, cur_streak
     current_count = 0
     last_user_id = None
@@ -139,6 +206,18 @@ def reset_state():
     milestones_reached.clear()
     cur_streak = 0
     save_state()
+
+
+async def reset_state_async():
+    """Асинхронный сброс — не блокирует event loop."""
+    global current_count, last_user_id, participants, milestone_participants, milestones_reached, cur_streak
+    current_count = 0
+    last_user_id = None
+    participants.clear()
+    milestone_participants.clear()
+    milestones_reached.clear()
+    cur_streak = 0
+    await save_state_async()
 
 
 # ============================================================
@@ -224,6 +303,7 @@ async def update_top1_role(guild: discord.Guild):
 async def on_ready():
     print(f"✅ Бот {bot.user} запущен!")
     print(f"📋 Канал для счёта: {CHANNEL_ID}")
+    print(f"📝 Канал логов: {LOG_CHANNEL_ID}")
     print(f"🎮 Режим: {MODE_NAMES.get(mode, mode)}")
     print(f"🎯 Рубеж (TARGET_COUNT): {TARGET_COUNT}")
     print(f"👑 Админы могут считать: {ADMINS_CAN_COUNT}")
@@ -314,7 +394,7 @@ async def handle_count_message(message):
         current_count = number
         last_user_id = message.author.id
         participants.add(message.author.id)
-        milestone_participants.add(message.author.id)   # ← текущий отрезок
+        milestone_participants.add(message.author.id)
 
         # === Статистика ===
         st = get_stats(message.author.id)
@@ -405,7 +485,7 @@ async def handle_count_message(message):
 
             current_count = rollback_to
             last_user_id = None
-            milestone_participants.clear()   # отрезок «обнулился» — начинаем новый
+            milestone_participants.clear()
             await save_state_async()
 
             if not author_is_admin:
@@ -519,7 +599,7 @@ async def handle_classic_success(message):
         print(f"⚠️ Ошибка при обработке победы: {e}")
 
     finally:
-        reset_state()
+        await reset_state_async()
 
 
 async def handle_endless_milestone(message, milestone):
@@ -540,7 +620,7 @@ async def handle_endless_milestone(message, milestone):
             f"(Роль **{ROLE_NAME}** не найдена, но это не важно — продолжаем!)"
         )
         milestone_participants.clear()
-        save_state()
+        await save_state_async()
         return
 
     success_count, failed = result
@@ -572,7 +652,7 @@ async def handle_endless_milestone(message, milestone):
 
     # сбрасываем отрезок после рубежа
     milestone_participants.clear()
-    save_state()
+    await save_state_async()
 
 
 # ============================================================
@@ -609,10 +689,28 @@ async def change_mode(
     mode = new_mode.value
 
     if reset:
-        reset_state()
+        await reset_state_async()
     else:
-        save_state()
+        await save_state_async()
 
+    # --- логирование в канал ---
+    log_channel = bot.get_channel(LOG_CHANNEL_ID)
+    if log_channel:
+        try:
+            await log_channel.send(
+                f"⚙️ **Смена режима**\n"
+                f"👤 Кто: {interaction.user.mention} (`{interaction.user.id}`)\n"
+                f"🔁 Было: **{MODE_NAMES[old_mode]}**\n"
+                f"➡️ Стало: **{MODE_NAMES[mode]}**\n"
+                f"🔄 Сброс счёта: **{'да' if reset else 'нет'}**\n"
+                f"📊 Текущий счёт: **{current_count}**"
+            )
+        except Exception as e:
+            print(f"⚠️ Не удалось отправить лог смены режима: {e}")
+    else:
+        print(f"⚠️ Канал логов {LOG_CHANNEL_ID} не найден или недоступен.")
+
+    # --- ответ пользователю ---
     if new_mode.value == old_mode:
         await interaction.response.send_message(
             f"🔄 Счёт сброшен. Режим остался прежним: **{MODE_NAMES[mode]}**\n"
@@ -631,7 +729,7 @@ async def change_mode(
 @bot.tree.command(name="reset_count", description="Сбросить счёт вручную")
 @app_commands.default_permissions(administrator=True)
 async def reset_count(interaction: discord.Interaction):
-    reset_state()
+    await reset_state_async()
     await interaction.response.send_message(
         "🔄 Счёт сброшен вручную. Начинаем с **1**.",
         ephemeral=False,
@@ -645,7 +743,7 @@ async def set_count(interaction: discord.Interaction, number: int):
     global current_count, last_user_id
     current_count = number
     last_user_id = None
-    save_state()
+    await save_state_async()
     await interaction.response.send_message(
         f"✅ Счёт установлен на **{number}**. Следующее число — **{number + 1}**.",
         ephemeral=False,
